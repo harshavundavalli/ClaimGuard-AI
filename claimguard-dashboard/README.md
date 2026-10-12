@@ -24,39 +24,91 @@ Healthcare providers submit insurance claims that may have missing documentation
 ## Architecture
 
 ```
-Data Sources → RAW (stages, COPY INTO) → Streams/Tasks → CORE (normalized views)
-                                                              │
-                                                              ▼
-                                                    ┌─────────────────────┐
-                                                    │    Cortex Agent     │
-                                                    │  ┌───────────────┐  │
-                                                    │  │ PolicySearch  │  │
-                                                    │  │ (Cortex Search│  │
-                                                    │  │  Service)     │  │
-                                                    │  └───────────────┘  │
-                                                    └─────────┬───────────┘
-                                                              │
-┌──────────────┐    ┌──────────────────┐    ┌─────────────────▼──────────┐
-│ Rules Engine │    │ Semantic View    │    │    Review Queue (APP)      │
-│ (SQL checks) │    │ (Cortex Analyst) │    │    Findings + Actions      │
-└──────┬───────┘    └────────┬─────────┘    └─────────────┬──────────────┘
-       │                     │                            │
-       └─────────────────────┴────────────────────────────┘
-                                    │
-                                    ▼
-                          Streamlit Dashboard
-                     (Queue → Review → Action → Audit)
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          DATA SOURCES                                   │
+│                                                                         │
+│  Snowflake Marketplace              CMS Policy Documents                │
+│  (Synthea: 1.4M patients,           (NCD 240.2, LCD L33797,            │
+│   124M claims, 763M obs)             PA A52510)                         │
+└──────────┬──────────────────────────────────────┬───────────────────────┘
+           │ zero-copy views                      │ chunked by section
+           ▼                                      ▼
+┌─────────────────────┐              ┌──────────────────────────┐
+│   CLAIMGUARD.CORE   │              │     CLAIMGUARD.RAG       │
+│                     │              │                          │
+│ 7 Views (patients,  │              │ POLICY_DOCUMENTS (3)     │
+│  claims, encounters,│              │ POLICY_CHUNKS (12)       │
+│  diagnoses, obs,    │              │ POLICY_REQUIREMENTS (15) │
+│  clinical evidence) │              │         │                │
+│                     │              │         ▼                │
+│ Semantic View ──────│──┐           │ Cortex Search Service    │
+│ (Cortex Analyst)    │  │           │ (vectors + keywords      │
+│                     │  │           │  + reranking)            │
+│ CLINICAL_NOTES (15) │  │           └────────────┬─────────────┘
+└────────┬────────────┘  │                        │
+         │               │                        │
+         ▼               │                        │
+┌─────────────────────┐  │                        │
+│  CLAIMGUARD.RAW     │  │                        │
+│                     │  │                        │
+│ INCOMING_CLAIMS     │  │                        │
+│   │                 │  │                        │
+│   ▼ Stream (CDC)    │  │                        │
+│   ▼ Task (5 min)    │  │                        │
+│   ├─→ REVIEW_QUEUE  │  │                        │
+│   └─→ DEAD_LETTER_Q │  │                        │
+└─────────────────────┘  │                        │
+                         │                        │
+┌────────────────────────┴────────────────────────┴───────────────────────┐
+│                        CLAIMGUARD.APP                                   │
+│                                                                         │
+│  ┌──────────────────┐ ┌──────────────────┐ ┌─────────────────────────┐  │
+│  │  Rules Engine    │ │  LLM Clinical    │ │    Cortex Agent         │  │
+│  │  (SQL function)  │ │  Note Analyzer   │ │  ┌─────────────────┐   │  │
+│  │                  │ │  (AI_COMPLETE)   │ │  │ PolicySearch    │   │  │
+│  │  8 deterministic │ │                  │ │  │ (Cortex Search) │   │  │
+│  │  checks          │ │  6 clinical note │ │  ├─────────────────┤   │  │
+│  │  (free, instant, │ │  checks          │ │  │ ClaimAnalytics  │   │  │
+│  │   100% accurate) │ │  (AI credits,    │ │  │ (Cortex Analyst)│◄─┘  │
+│  │                  │ │   on-demand)     │ │  └─────────────────┘      │
+│  └────────┬─────────┘ └────────┬─────────┘ └────────────┬──────────┘  │
+│           │                    │                         │             │
+│           │    REVIEW_QUEUE → FINDINGS → ACTIONS → AUDIT              │
+│           │                                                           │
+│  ┌────────┴───────────────────────────────────┐                       │
+│  │  Monitoring: 2 Alerts (hourly)             │                       │
+│  │  FAILED_CLAIMS_ALERT + DLQ_ALERT           │                       │
+│  │  → PIPELINE_RUNS log                       │                       │
+│  └────────────────────────────────────────────┘                       │
+└─────────────────────────────┬─────────────────────────────────────────┘
+                              │
+                              ▼
+                    ┌───────────────────┐
+                    │ Streamlit Dashboard│
+                    │   (4 pages)       │
+                    │                   │
+                    │ Queue │ Review    │
+                    │ Policy│ Pipeline  │
+                    └───────────────────┘
 ```
+
+**How the three intelligence layers work together:**
+
+- **Rules Engine** (Layer 1): Called first. 8 SQL checks run instantly against CORE views. Free, deterministic, 100% accurate. Catches missing O2 readings, wrong diagnosis codes, missing HCPCS codes.
+- **LLM Analyzer** (Layer 2): Called on-demand. 6 checks read clinical notes and interpret them against policy requirements using AI_COMPLETE. Non-deterministic, costs AI credits.
+- **Cortex Agent** (Layer 3): Interactive Q&A. Reviewer asks questions; agent searches policy documents (PolicySearch) and queries claim data (ClaimAnalytics via Semantic View) to compile evidence.
+
+All three are independent — Streamlit calls each directly. The agent does NOT orchestrate the other two.
 
 ### Layer Responsibilities
 
 | Layer | Schema | Components | Purpose |
 |-------|--------|------------|---------|
-| Ingestion | `RAW` | Stages, COPY INTO, stream, task | Land claims and detect new arrivals |
-| Structured Knowledge | `CORE` | 7 views over Marketplace data | Patient, claim, clinical data lookup |
-| Unstructured Knowledge | `RAG` | Policy documents, chunks, Cortex Search | Retrieve relevant policy passages |
-| Orchestration | `APP` | Cortex Agent, rules engine | Choose tools, compile evidence, check requirements |
-| Experience | `APP` | Streamlit dashboard | Queue, findings, reviewer action, pipeline status |
+| Ingestion | `RAW` | INCOMING_CLAIMS table, stream, 2 tasks, DLQ | Land claims, detect new arrivals, route invalid records |
+| Structured Knowledge | `CORE` | 7 views over Marketplace data, semantic view, clinical notes | Patient, claim, clinical data lookup (zero storage cost) |
+| Unstructured Knowledge | `RAG` | Policy documents, chunks, requirements, Cortex Search Service | Retrieve relevant policy passages via hybrid search |
+| Intelligence | `APP` | SQL rules engine (8 checks), LLM analyzer (6 checks), Cortex Agent (2 tools) | Check requirements, interpret notes, answer policy questions |
+| Experience | `APP` | Streamlit dashboard (4 pages), review workflow tables, 2 alerts | Queue, findings, reviewer action, pipeline monitoring |
 
 ---
 
@@ -300,13 +352,24 @@ Monitoring:
 ## Project Structure
 
 ```
-Workspace: USER$.PUBLIC."AI-Financial-Fraud-Investigation-Agent"
+Workspace: USER$.PUBLIC."ClaimGuard-AI"
 │
-├── claimguard-dashboard/          # Streamlit reviewer app
-│   ├── .streamlit/config.toml
-│   ├── pyproject.toml
-│   ├── snowflake.yml
-│   └── streamlit_app.py
+├── claimguard-dashboard/
+│   ├── .streamlit/config.toml         # Streamlit theme config
+│   ├── pyproject.toml                 # Python dependencies
+│   ├── snowflake.yml                  # Deployment config
+│   ├── streamlit_app.py               # 4-page reviewer dashboard
+│   ├── README.md                      # This file
+│   ├── ClaimGuard_AI_Documentation.html  # PDF-ready report
+│   └── sql/                           # Deployment scripts (run in order)
+│       ├── 01_database_and_schemas.sql
+│       ├── 02_core_views.sql
+│       ├── 03_semantic_view.sql
+│       ├── 04_rag_tables.sql
+│       ├── 05_app_tables.sql
+│       ├── 06_stream_tasks_alerts.sql
+│       ├── 07_functions_and_procedures.sql
+│       └── 08_rbac_and_cost_controls.sql
 │
 └── ClaimGuard_AI_Project_Documentation.pdf  # Original project plan
 ```
